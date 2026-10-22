@@ -1,0 +1,377 @@
+include "global.tbh"
+
+dim pull_state as en_pull_state
+dim pull_target as en_cert_target   'certificate being downloaded
+dim pull_ticks as byte
+dim pull_next as no_yes             'YES: start the server bundle download on the next tick
+dim pull_committed as byte          'certificates replaced in this run
+dim hdr_tail as string              'last 4 response bytes, to find CR LF CR LF
+dim status_line as string           'first 12 characters of the response, e.g. "HTTP/1.0 200"
+dim button_ticks as byte            'on_sys_timer ticks MD has been held
+dim long_press_done as no_yes       'YES: ignore the next release of MD
+dim reboot_pending as no_yes        'YES once the run has replaced a certificate
+
+'------------------------------------------------------------------------------
+sub on_sys_init()
+    boot()
+end sub
+
+'------------------------------------------------------------------------------
+sub boot()
+    net.ip        = DEVICE_IP
+    net.netmask   = DEVICE_MASK
+    net.gatewayip = DEVICE_GW
+
+    pull_state     = PULL_IDLE
+    pull_next      = NO
+    reboot_pending = NO
+    button_ticks    = 0
+    long_press_done = NO
+
+    cert_store_init()
+
+    sock.num = TLS_SERVER_SOCK
+    sock.rxbuffrq(TLS_RX_BUFF)
+    sock.txbuffrq(TLS_TX_BUFF)
+    sock.num = PULL_SOCK
+    sock.rxbuffrq(TLS_RX_BUFF)
+    sock.txbuffrq(TLS_TX_BUFF)
+    sys.buffalloc()
+    sys.debugprint("Buffer pages free after alloc: " + str(sys.freebuffpages) + "\r\n")
+
+    sock.num = TLS_SERVER_SOCK
+    sock.protocol      = PL_SOCK_PROTOCOL_TCP
+    sock.localportlist = TLS_SERVER_PORT
+    sock.inconmode     = PL_SOCK_INCONMODE_ANY_IP_ANY_PORT
+    sock.reconmode     = PL_SOCK_RECONMODE_1
+
+    sock.num = PULL_SOCK
+    sock.protocol  = PL_SOCK_PROTOCOL_TCP
+    sock.inconmode = PL_SOCK_INCONMODE_NONE
+    sock.reconmode = PL_SOCK_RECONMODE_0
+
+    sys.debugprint("CERT_UPDATE_PULL ready. TLS server on port " + TLS_SERVER_PORT + ". Press MD to download new certificates from https://" + PC_IP + ":" + str(PC_HTTPS_PORT) + "\r\n")
+    sys.debugprint("Hold MD for 2.5 s to restore the certificates from ROM.\r\n")
+end sub
+
+'------------------------------------------------------------------------------
+sub on_button_pressed()
+    button_ticks    = 0
+    long_press_done = NO
+end sub
+
+'------------------------------------------------------------------------------
+'A short press acts when MD is released. A long press acts in on_sys_timer while
+'MD is still held, so the release that follows it is ignored.
+sub on_button_released()
+    if long_press_done = YES then exit sub
+    if pull_state <> PULL_IDLE or pull_next = YES or reboot_pending = YES then
+        sys.debugprint("MD: download already running\r\n")
+        exit sub
+    end if
+    pull_committed = 0
+    pull_start(CERT_CA)
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sys_timer()
+    if button.pressed <> NO then
+        if long_press_done = NO then
+            button_ticks = button_ticks + 1
+            if button_ticks >= LONG_PRESS_TICKS then
+                long_press_done = YES
+                restore_rom_certs()
+            end if
+        end if
+    end if
+
+    'The reboot waits for a timer tick so the debug output above it is sent first,
+    'and until MD is released: a device that starts with MD pressed enters the
+    'monitor (firmware upload mode) instead of running the application.
+    if reboot_pending = YES then
+        if button.pressed = NO then
+            sys.debugprint("Rebooting to load the new certificates...\r\n")
+            sys.reboot
+        end if
+    end if
+
+    'The next download starts here, not in the close event of the previous one.
+    if pull_next = YES then
+        pull_next = NO
+        pull_start(CERT_BUNDLE)
+    end if
+
+    if pull_state <> PULL_IDLE then
+        pull_ticks = pull_ticks + 1
+        if pull_ticks >= PULL_TIMEOUT_TICKS then pull_fail("timed out")
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+'Long press: return to the certificates the firmware was built with. The flash
+'disk files are deleted now; the reboot, once MD is released, copies the ROM files again.
+sub restore_rom_certs()
+    if pull_state <> PULL_IDLE or pull_next = YES or reboot_pending = YES then
+        sys.debugprint("MD long press: a download is in progress, certificates not changed\r\n")
+        exit sub
+    end if
+    sys.debugprint("MD long press: certificates deleted from the flash disk. Release MD to reboot.\r\n")
+    cert_store_reset()
+    reboot_pending = YES
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if sock.num = TLS_SERVER_SOCK then
+        tls_server_event(newstate, newstatesimple)
+    else if sock.num = PULL_SOCK then
+        pull_event(newstate, newstatesimple)
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_data_arrival()
+    if sock.num = TLS_SERVER_SOCK then
+        tls_server_echo()
+    else if sock.num = PULL_SOCK then
+        pull_data()
+    end if
+end sub
+
+'==============================================================================
+' TLS server: echo, using the server bundle
+'==============================================================================
+sub tls_server_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        sys.debugprint("TLS server: connection closed\r\n")
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_POPENED:
+        sys.debugprint("TLS server: connection from " + sock.remoteip + ":" + str(sock.remoteport) + "\r\n")
+        if cert_size(CERT_BUNDLE) = 0 then
+            sys.debugprint("TLS server: no server bundle loaded, closing\r\n")
+            sock.close
+            exit sub
+        end if
+        sock.tlsdeinit
+        dim tls_res as pl_tls_result = cert_tls_init(CERT_BUNDLE)
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("TLS server: tlsinitfromarray FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+        tls_res = sock.tlshandshake("")
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("TLS server: tlshandshake FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+
+    case PL_SST_EST_TLS:
+        sys.debugprint("TLS server: TLS established\r\n")
+        sock.tlssetdata("Connected to CERT_UPDATE_PULL. Send data to echo." + chr(13) + chr(10))
+        sock.send
+
+    case PL_SST_EST_TLS_FAILED:
+        sys.debugprint("TLS server: TLS handshake FAILED - resetting\r\n")
+        sock.rxclear
+        sock.reset
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub tls_server_echo()
+    if sock.statesimple <> PL_SSTS_EST then exit sub
+    dim data as string = sock.tlsgetdata(255)
+    while len(data) > 0
+        sock.tlssetdata("ECHO: " + data)
+        sock.send
+        data = sock.tlsgetdata(255)
+    wend
+end sub
+
+'==============================================================================
+' Download: GET the CA certificate, then the server bundle, over HTTPS.
+'
+' The server is checked with the CA certificate the device already has, so only
+' a server the device trusts can deliver a replacement. Both downloads use the
+' CA certificate loaded at boot; a new one takes effect after the reboot.
+'
+' The request is HTTP/1.0, so the response is never chunked and its body ends
+' when the server closes the connection. cert_commit() then checks that the body
+' is complete.
+'==============================================================================
+sub pull_start(target as en_cert_target)
+    if cert_size(CERT_CA) = 0 then
+        sys.debugprint("Download: no CA certificate loaded, cannot check the server\r\n")
+        pull_finish()
+        exit sub
+    end if
+    if cert_new_open() <> OK then
+        pull_finish()
+        exit sub
+    end if
+
+    pull_target = target
+    pull_state  = PULL_CONNECTING
+    pull_ticks  = 0
+    hdr_tail    = ""
+    status_line = ""
+
+    sock.num        = PULL_SOCK
+    sock.targetip   = PC_IP
+    sock.targetport = PC_HTTPS_PORT
+    sys.debugprint("Download: " + cert_label(target) + ", connecting to " + PC_IP + ":" + str(PC_HTTPS_PORT) + "...\r\n")
+    sock.connect
+end sub
+
+'------------------------------------------------------------------------------
+'Ends the run after a failure. The current certificate is kept.
+sub pull_fail(reason as string)
+    sys.debugprint("Download: " + cert_label(pull_target) + " FAILED, " + reason + "\r\n")
+    cert_new_discard()
+    pull_state = PULL_IDLE
+    sock.num = PULL_SOCK
+    if sock.statesimple <> PL_SSTS_CLOSED then sock.close
+    pull_finish()
+end sub
+
+'------------------------------------------------------------------------------
+sub pull_finish()
+    if pull_committed > 0 then
+        reboot_pending = YES
+    else
+        sys.debugprint("Download: no certificate was replaced\r\n")
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub pull_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+#if PULL_DEBUG
+        sys.debugprint("Download: close event (state=" + str(newstate) + ", pull_state=" + str(pull_state) + ", rxlen=" + str(sock.rxlen) + ")\r\n")
+#endif
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        if pull_state = PULL_BODY then
+            pull_state = PULL_IDLE
+            if cert_commit(pull_target) = OK then
+                sys.debugprint("Download: " + cert_label(pull_target) + " replaced\r\n")
+                pull_committed = pull_committed + 1
+            end if
+            if pull_target = CERT_CA then
+                pull_next = YES
+            else
+                pull_finish()
+            end if
+        else if pull_state <> PULL_IDLE then
+            pull_fail("connection closed before the file was received (state=" + str(newstate) + ")")
+        end if
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_AOPENED:
+        sock.tlsdeinit
+        dim tls_res as pl_tls_result = cert_tls_init(CERT_CA)
+        if tls_res <> PL_TLS_SUCCESS then
+            pull_fail("tlsinitfromarray FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+        tls_res = sock.tlshandshake(PC_IP)
+        if tls_res <> PL_TLS_SUCCESS then
+            pull_fail("tlshandshake FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+
+    case PL_SST_EST_TLS:
+        dim path as string
+        if pull_target = CERT_CA then
+            path = CA_URL_PATH
+        else
+            path = BUNDLE_URL_PATH
+        end if
+        sys.debugprint("Download: TLS established, GET " + path + "\r\n")
+        pull_state = PULL_HEADERS
+        sock.tlssetdata("GET " + path + " HTTP/1.0" + chr(13) + chr(10) + "Host: " + PC_IP + chr(13) + chr(10) + "Connection: close" + chr(13) + chr(10) + chr(13) + chr(10))
+        sock.send
+
+    case PL_SST_EST_TLS_FAILED:
+        sock.rxclear
+        sock.reset
+        pull_fail("TLS handshake failed, the server did not pass the CA certificate check")
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub pull_data()
+    dim body as string
+    dim s as string = sock.tlsgetdata(255)
+#if PULL_DEBUG
+    sys.debugprint("Download: data event, read " + str(len(s)) + " bytes (pull_state=" + str(pull_state) + ")\r\n")
+#endif
+    while s <> ""
+        if pull_state = PULL_HEADERS then
+            body = pull_scan_headers(s)
+            s = body
+        end if
+        if pull_state = PULL_IDLE then exit sub
+        if pull_state = PULL_BODY then
+            if s <> "" then
+                if cert_new_write(s) <> OK then
+                    pull_fail("could not store the file")
+                    exit sub
+                end if
+            end if
+        end if
+        s = sock.tlsgetdata(255)
+#if PULL_DEBUG
+        if s <> "" then sys.debugprint("Download: read " + str(len(s)) + " more bytes\r\n")
+#endif
+    wend
+end sub
+
+'------------------------------------------------------------------------------
+'Scans response bytes for the blank line (CR LF CR LF) that ends the headers.
+'hdr_tail survives between calls, so the blank line may be split across reads.
+'Returns the bytes after the headers, which are the start of the body.
+'s is passed by value and the result goes to a different variable: assigning the
+'function's return value would otherwise overwrite s when the caller writes the
+'result back into the variable it passed.
+function pull_scan_headers(s as string) as string
+    dim i as word
+    dim c as string
+
+    for i = 1 to len(s)
+        c = mid(s, i, 1)
+        if len(status_line) < 12 then status_line = status_line + c
+
+        hdr_tail = hdr_tail + c
+        if len(hdr_tail) > 4 then hdr_tail = mid(hdr_tail, 2, 4)
+
+        if hdr_tail = chr(13) + chr(10) + chr(13) + chr(10) then
+#if PULL_DEBUG
+            sys.debugprint("Download: end of headers at byte " + str(i) + ", status '" + status_line + "'\r\n")
+#endif
+            'Status line: "HTTP/1.x 200 ..." - the code is characters 10 to 12.
+            if mid(status_line, 10, 3) <> "200" then
+                pull_fail("server answered '" + status_line + "'")
+                pull_scan_headers = ""
+                exit function
+            end if
+            pull_state = PULL_BODY
+            pull_scan_headers = mid(s, i + 1, len(s) - i)
+            exit function
+        end if
+    next i
+#if PULL_DEBUG
+    sys.debugprint("Download: no end of headers in " + str(len(s)) + " bytes\r\n")
+#endif
+    pull_scan_headers = ""
+end function

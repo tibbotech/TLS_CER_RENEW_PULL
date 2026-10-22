@@ -1,0 +1,94 @@
+'DEFINES-------------------------------------------------------------
+
+'--- Network (static IP) ---
+'DEVICE_IP must match the IP in the device's server certificate (server_bundle.der).
+const DEVICE_IP   = "192.168.1.218"
+const DEVICE_MASK = "255.255.255.0"
+const DEVICE_GW   = "192.168.1.1"
+
+'--- PC server the new certificates are downloaded from ---
+'PC_IP must match the IP in the PC server's certificate, which is checked with
+'the CA certificate (ca_cert.der).
+const PC_IP           = "192.168.1.70"
+const PC_HTTPS_PORT   = 9443
+const CA_URL_PATH     = "/ca_cert.der"        'new CA certificate
+const BUNDLE_URL_PATH = "/server_bundle.der"  'new server bundle
+
+'--- Ports ---
+const TLS_SERVER_PORT = "8443"                'TLS echo server, uses the server bundle
+
+'--- Sockets ---
+const TLS_SERVER_SOCK = 0
+const PULL_SOCK       = 1
+
+'Buffer sizes in pages (1 page = 256 bytes). 6 pages suits ECDSA P-256; use 8 for RSA 2048.
+#define TLS_RX_BUFF 6
+#define TLS_TX_BUFF 6
+
+'--- Certificate files ---
+const ROM_CA_FILE        = "ca_cert.der"        'ROM file copied to the flash disk on first boot
+const ROM_BUNDLE_FILE    = "server_bundle.der"  'ROM file copied to the flash disk on first boot
+const FD_CA_FILE         = "ca.der"             'flash disk file used to check the download server
+const FD_BUNDLE_FILE     = "bundle.der"         'flash disk file the TLS server uses
+const FD_CA_BAK          = "ca.bak"             'previous copy, exists only during an update
+const FD_BUNDLE_BAK      = "bundle.bak"         'previous copy, exists only during an update
+const FD_NEW_FILE        = "new.der"            'a replacement while it is being received
+
+const CERT_MAX_SIZE      = 3072     'largest accepted certificate file, in bytes (RAM array size)
+const CA_DER_OBJECTS     = 1        'a CA file is one certificate
+const BUNDLE_DER_OBJECTS = 2        'a server bundle is a certificate followed by a key
+const CERT_FILENUM       = 0        'flash disk file slot for the certificate files
+const NEW_FILENUM        = 1        'flash disk file slot for FD_NEW_FILE
+
+'--- Debug ---
+'1 prints each read of the download response and the state at the close event.
+#define PULL_DEBUG 0
+
+'--- Timing (on_sys_timer ticks, 0.5 s each) ---
+const LONG_PRESS_TICKS   = 5        'hold MD this long (about 2.5 s) to restore the ROM certificates
+const PULL_TIMEOUT_TICKS = 30       'abandon a download that has not finished within 15 s
+
+enum en_cert_target
+    CERT_CA,                        'CA certificate, checks the PC server (download)
+    CERT_BUNDLE                     'device certificate + key (TLS server)
+end enum
+
+enum en_pull_state
+    PULL_IDLE,                      'no download running
+    PULL_CONNECTING,                'TCP connect and TLS handshake in progress
+    PULL_HEADERS,                   'request sent, reading the HTTP status line and headers
+    PULL_BODY                       'writing the response body to the flash disk
+end enum
+
+'INCLUDES------------------------------------------------------------
+
+'DECLARATIONS--------------------------------------------------------
+'cert_store.tbs
+declare sub cert_store_init()
+declare sub cert_store_reset()
+declare function cert_fd_name(target as en_cert_target) as string
+declare function cert_bak_name(target as en_cert_target) as string
+declare function cert_label(target as en_cert_target) as string
+declare function fd_exists(byref fname as string) as no_yes
+declare sub cert_prepare(target as en_cert_target)
+declare sub cert_load(target as en_cert_target)
+declare function cert_size(target as en_cert_target) as word
+declare function cert_tls_init(target as en_cert_target) as pl_tls_result
+declare function cert_new_open() as ok_ng
+declare function cert_new_write(byref data as string) as ok_ng
+declare sub cert_new_close()
+declare sub cert_new_discard()
+declare function cert_commit(target as en_cert_target) as ok_ng
+declare function cert_der_check(expected as byte) as ok_ng
+
+'main.tbs
+declare sub boot()
+declare sub restore_rom_certs()
+declare sub tls_server_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub tls_server_echo()
+declare sub pull_start(target as en_cert_target)
+declare sub pull_fail(reason as string)
+declare sub pull_finish()
+declare sub pull_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub pull_data()
+declare function pull_scan_headers(s as string) as string
